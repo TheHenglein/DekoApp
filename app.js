@@ -1023,12 +1023,22 @@ function conflictDialog() {
 }
 
 /* =================================================================== Import / Export */
-function loadXLSX() {
-  if (window.XLSX) return Promise.resolve();
+function loadScript(src) {
   return new Promise((res, rej) => {
-    const s = document.createElement("script"); s.src = "lib/xlsx.full.min.js"; s.onload = res;
-    s.onerror = () => rej(new Error("Import-Modul konnte nicht geladen werden")); document.head.appendChild(s);
+    const s = document.createElement("script"); s.src = src;
+    s.onload = () => (window.XLSX ? res() : rej(new Error("leer")));
+    s.onerror = () => { s.remove(); rej(new Error("nicht gefunden")); };
+    document.head.appendChild(s);
   });
+}
+/* Import-Modul: zuerst die mitgelieferte Datei, sonst dieselbe Version aus dem Netz */
+async function loadXLSX() {
+  if (window.XLSX) return;
+  try { await loadScript("lib/xlsx.full.min.js"); }
+  catch {
+    try { await loadScript("https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"); }
+    catch { throw new Error("Import-Modul konnte nicht geladen werden (Datei lib/xlsx.full.min.js fehlt und keine Internetverbindung)"); }
+  }
 }
 function pickFile(accept) {
   return new Promise((res) => {
