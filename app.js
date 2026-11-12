@@ -143,7 +143,7 @@ function compute() {
 const Sync = {
   mode: lsGet(LS.mode), // "drive" | "local" | null
   status: "idle", // idle | saving | saved | offline | error | auth
-  fileId: null, folderId: null, photoFolderId: null, version: null,
+  fileId: null, folderId: null, photoFolderId: null, version: null, lastSave: null,
   dirty: false, timer: null, token: null, tokenExp: 0, tokenClient: null, email: null,
 
   setStatus(st) { this.status = st; renderSync(); },
@@ -151,12 +151,12 @@ const Sync = {
   loadCache() {
     const d = lsGet(LS.data); const m = lsGet(LS.meta) || {};
     Object.assign(this, { fileId: m.fileId || null, folderId: m.folderId || null, photoFolderId: m.photoFolderId || null,
-      version: m.version || null, dirty: !!m.dirty, email: m.email || null });
+      version: m.version || null, lastSave: m.lastSave || null, dirty: !!m.dirty, email: m.email || null });
     return d;
   },
   saveCache() {
     lsSet(LS.data, db);
-    lsSet(LS.meta, { fileId: this.fileId, folderId: this.folderId, photoFolderId: this.photoFolderId, version: this.version,
+    lsSet(LS.meta, { fileId: this.fileId, folderId: this.folderId, photoFolderId: this.photoFolderId, version: this.version, lastSave: this.lastSave,
       dirty: this.dirty, email: this.email });
   },
 
@@ -220,7 +220,7 @@ const Sync = {
     const fd = new FormData();
     fd.append("metadata", new Blob([JSON.stringify(meta)], { type: "application/json" }));
     fd.append("file", blob);
-    const url = `https://www.googleapis.com/upload/drive/v3/files${id ? "/" + id : ""}?uploadType=multipart&fields=id,version`;
+    const url = `https://www.googleapis.com/upload/drive/v3/files${id ? "/" + id : ""}?uploadType=multipart&fields=id,md5Checksum`;
     return (await this.api(url, { method, body: fd })).json();
   },
   async whoAmI() {
@@ -243,16 +243,31 @@ const Sync = {
     }
     return "missing";
   },
+  /* Prüfsumme des Dateiinhalts – ändert sich nur, wenn sich der Inhalt ändert */
+  async checksum() {
+    const m = await (await this.api(`https://www.googleapis.com/drive/v3/files/${this.fileId}?fields=md5Checksum`)).json();
+    return m.md5Checksum || null;
+  },
+  /* Wurde die Datei seit unserem letzten Speichern von einem anderen Gerät überschrieben? */
+  async changedElsewhere() {
+    const sum = await this.checksum();
+    if (!this.version || sum === this.version) { this.version = sum; return false; }
+    // Inhalt hat sich geändert: stammt der Stand trotzdem von unserem letzten Speichern?
+    const remote = await (await this.api(`https://www.googleapis.com/drive/v3/files/${this.fileId}?alt=media`)).json();
+    const legacy = !/^[0-9a-f]{32}$/.test(this.version);   // Stand aus der Vorversion der App
+    if (legacy || !remote.saveId || remote.saveId === this.lastSave) { this.version = sum; return false; }
+    return true;
+  },
   async pull() {
-    const meta = await (await this.api(`https://www.googleapis.com/drive/v3/files/${this.fileId}?fields=version`)).json();
     const data = await (await this.api(`https://www.googleapis.com/drive/v3/files/${this.fileId}?alt=media`)).json();
-    this.version = meta.version;
+    this.version = await this.checksum();
+    this.lastSave = data.saveId || null;
     return data;
   },
   async createFile(data) {
     const r = await this.multipart({ name: CFG.driveFile, parents: [this.folderId], mimeType: "application/json" },
       new Blob([JSON.stringify(data, null, 1)], { type: "application/json" }));
-    this.fileId = r.id; this.version = r.version;
+    this.fileId = r.id; this.version = r.md5Checksum; this.lastSave = data.saveId || null;
   },
   async push(force = false) {
     if (this.mode !== "drive" || !this.dirty) { if (this.mode === "drive") this.setStatus("saved"); return; }
@@ -261,14 +276,12 @@ const Sync = {
     this._pushing = true; this.setStatus("saving");
     try {
       if (!this.fileId) { await this.connect(false); if (!this.fileId) await this.createFile(db); }
-      if (!force && this.version) {
-        const m = await (await this.api(`https://www.googleapis.com/drive/v3/files/${this.fileId}?fields=version`)).json();
-        if (m.version !== this.version) { this._pushing = false; return conflictDialog(); }
-      }
-      const r = await (await this.api(`https://www.googleapis.com/upload/drive/v3/files/${this.fileId}?uploadType=media&fields=version`, {
+      if (!force && await this.changedElsewhere()) { this._pushing = false; return conflictDialog(); }
+      db.saveId = uid();
+      const r = await (await this.api(`https://www.googleapis.com/upload/drive/v3/files/${this.fileId}?uploadType=media&fields=md5Checksum`, {
         method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(db, null, 1)
       })).json();
-      this.version = r.version; this.dirty = false; this.saveCache(); this.setStatus("saved");
+      this.version = r.md5Checksum; this.lastSave = db.saveId; this.dirty = false; this.saveCache(); this.setStatus("saved");
     } catch (e) {
       console.warn(e);
       this.setStatus(e.auth ? "auth" : navigator.onLine ? "error" : "offline");
@@ -278,9 +291,11 @@ const Sync = {
   async refresh() {
     if (this.mode !== "drive" || !this.fileId || this.dirty || !navigator.onLine) return;
     try {
-      const m = await (await this.api(`https://www.googleapis.com/drive/v3/files/${this.fileId}?fields=version`)).json();
-      if (m.version !== this.version) {
-        db = migrate(await this.pull()); this.saveCache(); render(); toast("Neue Daten vom anderen Gerät geladen");
+      if (await this.checksum() !== this.version) {
+        const before = this.lastSave;
+        const data = await this.pull();
+        if (!before || data.saveId !== before) { db = migrate(data); render(); toast("Neue Daten vom anderen Gerät geladen"); }
+        this.saveCache();
       }
       this.setStatus("saved");
     } catch (e) { if (e.auth) this.setStatus("auth"); }
@@ -1335,8 +1350,7 @@ window.addEventListener("beforeunload", (e) => { if (Sync.mode === "drive" && Sy
     if (!navigator.onLine) return Sync.setStatus("offline");
     try {
       if (!Sync.fileId) { const st = await Sync.connect(false); if (st === "missing") { await Sync.createFile(db); } }
-      const meta = await (await Sync.api(`https://www.googleapis.com/drive/v3/files/${Sync.fileId}?fields=version`)).json();
-      if (meta.version !== Sync.version) { db = migrate(await Sync.pull()); Sync.saveCache(); render(); }
+      if (await Sync.checksum() !== Sync.version) { db = migrate(await Sync.pull()); Sync.saveCache(); render(); }
       Sync.setStatus("saved");
     } catch (e) { Sync.setStatus(e.auth ? "auth" : "error"); }
   }
